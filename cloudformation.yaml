@@ -1,0 +1,302 @@
+Resources:
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: main-upload-user
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+
+  ThumbnailGenerate:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: thumbnail-lambda-result
+
+  FaceMaskDetect:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: mask-lambda-result
+
+  SNSTopic:
+    Type: "AWS::SNS::Topic"
+    Properties:
+        DisplayName: ""
+        TopicName: "trigger"
+  
+  SNSSubscription:
+      Type: "AWS::SNS::Subscription"
+      Properties:
+          TopicArn: !Ref SNSTopic
+          Endpoint: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:facemask"
+          Protocol: "lambda"
+          Region: !Ref AWS::Region
+
+  EmailSubscription:
+      Type: "AWS::SNS::Subscription"
+      Properties:
+          TopicArn: !Ref SNSTopic
+          Endpoint: "shahsaumya261@gmail.com" # Email address
+          Protocol: "email"        
+
+  LambdaFunction:
+      Type: "AWS::Lambda::Function"
+      Properties:
+          Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/LabRole"
+          Runtime: python3.10
+          FunctionName: "label"
+          Handler: "index.lambda_handler"
+          Architectures: 
+            - "x86_64"
+          Code: 
+            ZipFile: |
+              import boto3
+
+              rekognition_client = boto3.client('rekognition')
+              s3_client = boto3.client('s3')
+
+              def lambda_handler(event, context):
+                  # Get the S3 bucket and key from the event
+                  bucket = event['detail']['bucket']['name']
+                  key = event['detail']['object']['key']
+                  
+                  # Fetch the image from the specified S3 bucket
+                  response = s3_client.get_object(
+                      Bucket=bucket,
+                      Key=key
+                  )
+                  
+                  # Get the image bytes
+                  image_bytes = response['Body'].read()
+                  
+                  # Perform object and scene detection using Rekognition
+                  response = rekognition_client.detect_labels(
+                      Image={
+                          'Bytes': image_bytes
+                      }
+                  )
+                  
+                  # Extract the detected labels from the response
+                  detected_labels = response['Labels']
+                  
+                  # Prepare the results
+                  results = []
+                  for label in detected_labels:
+                      results.append({
+                          'Name': label['Name'],
+                          'Confidence': label['Confidence']
+                      })
+                  
+                  # Return the detected labels as the Lambda function output
+                  return {
+                      'bucket': bucket,
+                      'key': key,
+                      'results': results
+                  }
+
+  LambdaFunction2:
+      Type: "AWS::Lambda::Function"
+      Properties:
+          Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/LabRole"
+          Runtime: python3.10
+          FunctionName: "detect"
+          Handler: "index.lambda_handler"
+          Architectures: 
+            - "x86_64"
+          Code:
+            ZipFile: | 
+              import boto3
+              import json
+
+              s3_client = boto3.client('s3')
+              sns_client = boto3.client('sns')
+
+              def lambda_handler(event, context):
+                  # Get the detected labels from the input event
+                  detected_labels = event['results']
+                  
+                  # Prepare the results
+                  results = []
+                  for label in detected_labels:
+                      results.append({
+                          'Name': label['Name'],
+                          'Confidence': label['Confidence']
+                      })
+                  
+                  # Upload the results to the "thumbnail17" S3 bucket
+                  s3_client.put_object(
+                      Bucket='thumbnail-lambda-result',
+                      Key='object_scene_detection_results.json',
+                      Body=json.dumps(results)
+                  )
+                  
+                  # Check if a person is present in the image
+                  is_person_present = any(label['Name'] == 'Person' for label in detected_labels)
+                  
+                  # If a person is detected, publish to the "trigger" SNS topic
+                  sns_client.publish(
+                      TopicArn='arn:aws:sns:us-east-1:578569578438:trigger',
+                      Message=json.dumps(event)
+                  )
+                  
+                  # Return success or any desired response
+                  return {
+                      'statusCode': 200,
+                      'body': 'Results stored and SNS notification sent successfully'
+                  }
+
+  LambdaFunction3:
+      Type: "AWS::Lambda::Function"
+      Properties:
+          Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/LabRole"
+          Runtime: python3.10
+          FunctionName: "facemask"
+          Timeout: 30
+          Handler: "index.lambda_handler"
+          Architectures: 
+            - "x86_64"
+          Code:
+            ZipFile: |
+              import boto3
+              import json
+
+              rekognition_client = boto3.client('rekognition')
+              s3_client = boto3.client('s3')
+              sns_client = boto3.client('sns')
+
+              def lambda_handler(event, context):
+                  try:
+                      # Extract the S3 bucket and key from the input event
+                      message = json.loads(event['Records'][0]['Sns']['Message'])
+                      bucket = message['bucket']
+                      key = message['key']
+                  
+                      # Fetch the image from the specified S3 bucket
+                      response = s3_client.get_object(
+                          Bucket=bucket,
+                          Key=key
+                      )
+                      
+                      # Get the image bytes
+                      image_bytes = response['Body'].read()
+                      
+                      # Perform face mask detection using Rekognition
+                      response = rekognition_client.detect_protective_equipment(
+                          Image={
+                              'Bytes': image_bytes
+                          },
+                          SummarizationAttributes={
+                              'MinConfidence': 80,
+                              'RequiredEquipmentTypes': ['FACE_COVER']
+                          }
+                      )
+                      
+                      # Check if response contains 'Persons' key and non-empty list
+                      is_face_mask_detected = False
+                      if 'Persons' in response and isinstance(response['Persons'], list):
+                          # Check if face mask is detected
+                          for person in response['Persons']:
+                              for body_part in person.get('BodyParts', []):
+                                  if body_part['Name'] == 'FACE':
+                                      for detection in body_part.get('EquipmentDetections', []):
+                                          if detection['Type'] == 'FACE_COVER' and detection['CoversBodyPart']['Value']:
+                                              is_face_mask_detected = True
+                                              break
+                              if is_face_mask_detected:
+                                  break
+                      
+                      # Prepare the result
+                      result = {
+                          'bucket': bucket,
+                          'key': key,
+                          'is_face_mask_detected': is_face_mask_detected
+                      }
+                      
+                      # Store the result in the "user-video1" S3 bucket as a JSON file
+                      s3_client.put_object(
+                          Bucket='mask-lambda-result',
+                          Key=f'{key}.json',
+                          Body=json.dumps(result)
+                      )
+                      
+                      # Upload the image to the "user-video1" S3 bucket if face mask is detected
+                      if is_face_mask_detected:
+                          s3_client.put_object(
+                              Bucket='mask-lambda-result',
+                              Key=key,
+                              Body=image_bytes
+                          )
+                      
+                      # If face mask is detected, publish to the "trigger" SNS topic with the bucket name and key in the message
+                      if is_face_mask_detected:
+                          sns_client.publish(
+                              TopicArn='arn:aws:sns:us-east-1:578569578438:trigger',
+                              Message=json.dumps({
+                                  'bucketName': bucket,
+                                  'objectKey': key
+                              })
+                          )
+                      
+                      # Return the result
+                      return result
+                  except Exception as e:
+                      # Handle the timeout event
+                      if 'Task timed out' in str(e):
+                          return {
+                              'errorMessage': 'TimeoutError',
+                              'errorType': 'TimeoutError'
+                          }
+                      else:
+                          # Handle other exceptions
+                          return {
+                              'errorMessage': str(e),
+                              'errorType': type(e).__name__
+                          }
+
+  LambdaSnsPermission:
+        Type: "AWS::Lambda::Permission"
+        Properties:
+            FunctionName: !GetAtt LambdaFunction3.Arn
+            Action: "lambda:InvokeFunction"
+            Principal: "sns.amazonaws.com"
+            SourceArn: !Sub "arn:aws:sns:us-east-1:${AWS::AccountId}:trigger"
+  EventsRule:
+      Type: "AWS::Events::Rule"
+      Properties:
+          Name: "trigger"
+          Description: "Trigger state machine when image uploaded"
+          EventPattern: "{\"source\":[\"aws.s3\"],\"detail-type\":[\"Object Created\"],\"detail\":{\"bucket\":{\"name\":[\"main-upload-user\"]}}}"
+          State: "ENABLED"
+          Targets: 
+            - 
+              Arn: !Ref StepFunctionsStateMachine
+              Id: "Idc7880006-6b33-4d1f-80f3-8ec58b4c2386"
+              RoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/LabRole"
+          EventBusName: "default"
+
+  StepFunctionsStateMachine:
+      Type: "AWS::StepFunctions::StateMachine"
+      Properties:
+          StateMachineName: "MyStateMachine"
+          DefinitionString: !Sub |
+              {
+                "Comment": "Step Functions workflow to generate thumbnail and perform content moderation",
+                "StartAt": "ObjectDetection",
+                "States": {
+                  "ObjectDetection": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${LambdaFunction}",
+                    "Next": "StoreContent"
+                  },
+                  "StoreContent": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${LambdaFunction2}",
+                    "End": true
+                  }
+                }
+              }
+          RoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/LabRole"
+          StateMachineType: "STANDARD"
+          LoggingConfiguration: 
+              IncludeExecutionData: false
+              Level: "OFF"
+
